@@ -15,13 +15,20 @@ class SyncOrchestrator {
         this.isRunning = false;
         this.lastSyncResult = null;
         this.cronJob = null;
+        this.initialized = false;
     }
 
     /**
      * Initialize sync service
-     * Tests connections and optionally runs initial sync
+     * Tests connections and runs initial sync exactly once
      */
     async initialize() {
+        // Prevent multiple initializations
+        if (this.initialized) {
+            logger.warn('Sync Orchestrator already initialized, skipping...');
+            return;
+        }
+
         logger.info('Initializing Sync Orchestrator...');
 
         // Test database connection
@@ -36,16 +43,16 @@ class SyncOrchestrator {
             logger.warn('Odoo API connection failed - sync will be attempted later');
         }
 
-        // Setup cron job if enabled
+        // Mark as initialized before running sync
+        this.initialized = true;
+
+        // Run initial sync exactly once at startup
+        logger.info('Running initial sync on startup...');
+        await this.runFullSync();
+
+        // Setup cron job if enabled (for subsequent syncs)
         if (process.env.AUTO_SYNC_ENABLED === 'true') {
             this.setupCronJob();
-        }
-
-        // Run initial sync if configured
-        if (process.env.SYNC_ON_STARTUP === 'true') {
-            logger.info('Running initial sync on startup...');
-            // Run in background to not block startup
-            setImmediate(() => this.runFullSync());
         }
 
         logger.info('Sync Orchestrator initialized successfully');
@@ -55,7 +62,7 @@ class SyncOrchestrator {
      * Setup cron job for automatic sync
      */
     setupCronJob() {
-        const schedule = process.env.SYNC_CRON_SCHEDULE || '*/5 * * * *';
+        const schedule = process.env.SYNC_CRON_SCHEDULE || '* * * * *';
         
         if (this.cronJob) {
             this.cronJob.stop();
@@ -111,28 +118,27 @@ class SyncOrchestrator {
 
             // Sync products
             logger.info('--- Syncing Products ---');
-            results.products = await productSyncService.syncFromOdoo();
+            results.products = await productSyncService.syncAllProducts();
             if (!results.products.success) {
                 logger.warn('Product sync had issues:', results.products.error);
             }
 
-            // Sync loyalty programs
-            logger.info('--- Syncing Loyalty Programs ---');
-            results.loyalty = await loyaltySyncService.syncFromOdoo();
-            if (!results.loyalty.success) {
-                logger.warn('Loyalty sync had issues:', results.loyalty.error);
-            }
+            // Sync loyalty programs (uncomment when ready)
+            // logger.info('--- Syncing Loyalty Programs ---');
+            // results.loyalty = await loyaltySyncService.syncFromOdoo();
+            // if (!results.loyalty.success) {
+            //     logger.warn('Loyalty sync had issues:', results.loyalty.error);
+            // }
 
             results.endTime = new Date().toISOString();
             results.duration = Date.now() - startTime;
-            results.success = results.products?.success && results.loyalty?.success;
+            results.success = results.products?.success;
 
             this.lastSyncResult = results;
 
             logger.info('========================================');
             logger.info(`Full Sync Completed in ${results.duration}ms`);
             logger.info(`Products: ${JSON.stringify(results.products?.stats || {})}`);
-            logger.info(`Loyalty: ${JSON.stringify(results.loyalty?.stats || {})}`);
             logger.info('========================================');
 
             return results;
@@ -160,7 +166,7 @@ class SyncOrchestrator {
         this.isRunning = true;
         try {
             logger.info('Starting Products Sync...');
-            const result = await productSyncService.syncFromOdoo();
+            const result = await productSyncService.syncAllProducts();
             return result;
         } finally {
             this.isRunning = false;
@@ -191,6 +197,7 @@ class SyncOrchestrator {
     getStatus() {
         return {
             isRunning: this.isRunning,
+            initialized: this.initialized,
             lastSync: this.lastSyncResult,
             cronEnabled: !!this.cronJob,
             cronSchedule: process.env.SYNC_CRON_SCHEDULE || '*/5 * * * *'
@@ -236,6 +243,7 @@ class SyncOrchestrator {
     async cleanup() {
         this.stopCronJob();
         await db.closePool();
+        this.initialized = false;
         logger.info('Sync Orchestrator cleaned up');
     }
 }

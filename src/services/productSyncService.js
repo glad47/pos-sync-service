@@ -1,6 +1,7 @@
 /**
  * Product Sync Service
  * Handles synchronization of products between Odoo and local MySQL database
+ * Compares using id and only updates changed records
  */
 
 const db = require('../config/database');
@@ -13,6 +14,7 @@ class ProductSyncService {
             created: 0,
             updated: 0,
             skipped: 0,
+            unchanged: 0,
             errors: 0,
             lastSync: null
         };
@@ -26,6 +28,7 @@ class ProductSyncService {
             created: 0,
             updated: 0,
             skipped: 0,
+            unchanged: 0,
             errors: 0,
             lastSync: null
         };
@@ -39,15 +42,65 @@ class ProductSyncService {
     }
 
     /**
-     * Check if product exists in local database
-     * @param {string} barcode 
+     * Load all local products indexed by id
+     * @returns {Map<number, Object>} Map of id to product data
      */
-    async productExists(barcode) {
-        const result = await db.query(
-            'SELECT id, updated_at FROM products WHERE barcode = ?',
-            [barcode]
-        );
-        return result.length > 0 ? result[0] : null;
+    async loadLocalProducts() {
+        const products = await db.query('SELECT * FROM products');
+        const productMap = new Map();
+        
+        for (const product of products) {
+            if (product.id) {
+                productMap.set(product.id, product);
+            }
+        }
+        
+        logger.info(`Loaded ${productMap.size} local products`);
+        return productMap;
+    }
+
+    /**
+     * Check if product data has changed
+     * @param {Object} odooProduct - Transformed product from Odoo
+     * @param {Object} localProduct - Existing product from local DB
+     * @returns {boolean} True if product has changes
+     */
+    hasChanges(odooProduct, localProduct) {
+        // Compare relevant fields
+        const fieldsToCompare = [
+            { odoo: 'template_id', local: 'template_id', transform: (v) => parseInt(v) || null },
+            { odoo: 'name', local: 'name' },
+            { odoo: 'description', local: 'description' },
+            { odoo: 'barcode', local: 'barcode' },
+            { odoo: 'list_price', local: 'price', transform: (v) => parseFloat(v) || 0 },
+            { odoo: 'stock', local: 'stock', transform: (v) => parseInt(v) || 0 },
+            { odoo: 'category', local: 'category' },
+            { odoo: 'tax_rate', local: 'tax_rate', transform: (v) => parseFloat(v) || 0 },
+            { odoo: 'active', local: 'active', transform: (v) => v !== false ? 1 : 0 }
+        ];
+
+        for (const field of fieldsToCompare) {
+            let odooValue = odooProduct[field.odoo];
+            let localValue = localProduct[field.local];
+
+            // Apply transformation if specified
+            if (field.transform) {
+                odooValue = field.transform(odooValue);
+                localValue = field.transform(localValue);
+            }
+
+            // Handle null/undefined comparison
+            if (odooValue === null || odooValue === undefined) odooValue = null;
+            if (localValue === null || localValue === undefined) localValue = null;
+
+            // Compare values
+            if (odooValue !== localValue) {
+                logger.debug(`Field ${field.odoo} changed: "${localValue}" -> "${odooValue}"`);
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -58,29 +111,32 @@ class ProductSyncService {
         try {
             const sql = `
                 INSERT INTO products (
-                    barcode, name, description, price, stock, 
-                    category, tax_rate, active, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                    id, template_id, barcode, name, description, 
+                    price, stock, category, tax_rate, active, 
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
             `;
             
             const params = [
-                product.barcode,
-                product.name || 'Unknown Product',
-                product.description || null,
-                product.list_price || product.price || 0,
-                product.stock || 0,
-                product.category || 'General',
-                product.tax_rate || 0.15, // Default 15% VAT for Saudi Arabia
-                product.active !== false
+                product.id ?? null,
+                product.template_id ?? null,
+                product.barcode ?? null,
+                product.name ?? 'Unknown Product',
+                product.description ?? null,
+                product.list_price ?? 0,
+                product.stock ?? 0,
+                product.category ?? 'General',
+                product.tax_rate ?? 0.15,
+                product.active !== false ? 1 : 0
             ];
 
-            const result = await db.query(sql, params);
+            await db.query(sql, params);
             this.syncStats.created++;
-            logger.info(`Created product: ${product.barcode} - ${product.name}`);
-            return result.insertId;
+            logger.info(`Created product: [${product.id}] ${product.name}`);
+            return product.id;
         } catch (error) {
             this.syncStats.errors++;
-            logger.error(`Failed to create product ${product.barcode}:`, error.message);
+            logger.error(`Failed to create product ${product.id}:`, error.message);
             throw error;
         }
     }
@@ -94,6 +150,8 @@ class ProductSyncService {
         try {
             const sql = `
                 UPDATE products SET
+                    template_id = ?,
+                    barcode = ?,
                     name = ?,
                     description = ?,
                     price = ?,
@@ -106,50 +164,25 @@ class ProductSyncService {
             `;
 
             const params = [
-                product.name || 'Unknown Product',
-                product.description || null,
-                product.list_price || product.price || 0,
-                product.stock || 0,
-                product.category || 'General',
-                product.tax_rate || 0.15,
-                product.active !== false,
+                product.template_id ?? null,
+                product.barcode ?? null,
+                product.name ?? 'Unknown Product',
+                product.description ?? null,
+                product.list_price ?? 0,
+                product.stock ?? 0,
+                product.category ?? 'General',
+                product.tax_rate ?? 0.15,
+                product.active !== false ? 1 : 0,
                 existingId
             ];
 
             await db.query(sql, params);
             this.syncStats.updated++;
-            logger.info(`Updated product: ${product.barcode} - ${product.name}`);
+            logger.info(`Updated product: [${product.id}] ${product.name}`);
         } catch (error) {
             this.syncStats.errors++;
-            logger.error(`Failed to update product ${product.barcode}:`, error.message);
+            logger.error(`Failed to update product ${product.id}:`, error.message);
             throw error;
-        }
-    }
-
-    /**
-     * Sync a single product
-     * @param {Object} product - Product data from Odoo
-     */
-    async syncProduct(product) {
-        if (!product.barcode) {
-            logger.warn('Skipping product without barcode:', product.name);
-            this.syncStats.skipped++;
-            return null;
-        }
-
-        try {
-            const existing = await this.productExists(product.barcode);
-            
-            if (existing) {
-                await this.updateProduct(product, existing.id);
-                return { action: 'updated', id: existing.id };
-            } else {
-                const newId = await this.createProduct(product);
-                return { action: 'created', id: newId };
-            }
-        } catch (error) {
-            logger.error(`Error syncing product ${product.barcode}:`, error.message);
-            return { action: 'error', error: error.message };
         }
     }
 
@@ -158,19 +191,49 @@ class ProductSyncService {
      * @param {Object} odooProduct - Raw product data from Odoo
      */
     transformOdooProduct(odooProduct) {
-        // Handle different data structures from Odoo
         const data = odooProduct.data || odooProduct;
         
+        // Debug: log first product structure to understand the data
+        // logger.debug('Raw Odoo product data:', JSON.stringify(data));
+        
+        // Handle different field naming from Odoo API
+        // If product_id exists, use it as id; otherwise id is actually template_id
+        let productId, templateId;
+        
+        if (data.product_id !== undefined && data.product_id !== null) {
+            // API returns: id=template_id, product_id=product_id
+            productId = data.product_id;
+            templateId = data.template_id ?? data.id;
+        } else {
+            // API returns: id=product_id, template_id=template_id
+            productId = data.id;
+            templateId = data.template_id;
+        }
+        
         return {
-            barcode: data.barcode,
+            id: productId ?? null,
+            template_id: templateId ?? null,
+            barcode: data.barcode ?? null,
             name: this.extractName(data.name),
-            description: data.description || null,
+            description: this.extractName(data.description),
             list_price: parseFloat(data.list_price) || 0,
             stock: parseInt(data.stock || data.qty_available) || 0,
-            category: data.category || data.categ_id?.name || 'General',
-            tax_rate: this.calculateTaxRate(data),
+            category: this.extractCategory(data.category),
+            tax_rate: parseFloat(data.tax_rate) || 0.15,
             active: data.active !== false
         };
+    }
+
+    /**
+     * Extract category from various formats
+     * @param {Object|string} category 
+     */
+    extractCategory(category) {
+        if (typeof category === 'string') return category;
+        if (typeof category === 'object' && category !== null) {
+            return category.en_US || category.ar_001 || category.en || Object.values(category)[0] || 'General';
+        }
+        return 'General';
     }
 
     /**
@@ -186,52 +249,74 @@ class ProductSyncService {
     }
 
     /**
-     * Calculate tax rate from Odoo data
-     * @param {Object} data 
+     * Full sync - Load all from Odoo, compare with local, update only changes
      */
-    calculateTaxRate(data) {
-        // Default to 15% VAT for Saudi Arabia
-        if (data.tax_rate) return parseFloat(data.tax_rate);
-        if (data.taxes_id && Array.isArray(data.taxes_id) && data.taxes_id.length > 0) {
-            // If tax data is available, try to extract rate
-            const tax = data.taxes_id[0];
-            if (typeof tax === 'object' && tax.amount) {
-                return parseFloat(tax.amount) / 100;
-            }
-        }
-        return 0.15; // Default 15% VAT
-    }
-
-    /**
-     * Full sync from Odoo API
-     * Uses the sync endpoint to get changed products
-     */
-    async syncFromOdoo() {
+    async syncAllProducts() {
         this.resetStats();
         const startTime = Date.now();
         
         try {
             logger.info('Starting product sync from Odoo...');
             
-            // Get sync data from Odoo
-            const syncData = await odooApi.getProductsSync();
+            // Step 1: Load all products from Odoo
+            logger.info('Loading products from Odoo...');
+            const response = await odooApi.getAllProducts();
             
-            if (!syncData.success) {
-                throw new Error(syncData.error || 'Failed to get sync data from Odoo');
+            if (response.status !== 'success') {
+                throw new Error(response.message || 'Failed to get products from Odoo');
             }
 
-            const { changes } = syncData;
-            const allChanges = [
-                ...(changes.created || []),
-                ...(changes.updated || [])
-            ];
+            const odooProducts = response.data || [];
+            logger.info(`Loaded ${odooProducts.length} products from Odoo`);
 
-            logger.info(`Processing ${allChanges.length} product changes...`);
+            // Step 2: Load all local products indexed by id
+            logger.info('Loading local products...');
+            const localProductsMap = await this.loadLocalProducts();
 
-            // Process each product change
-            for (const change of allChanges) {
-                const product = this.transformOdooProduct(change);
-                await this.syncProduct(product);
+            // Step 3: Process each Odoo product
+            logger.info('Comparing and syncing products...');
+            
+            // Debug: log first product to see data structure
+            if (odooProducts.length > 0) {
+                logger.debug('First product raw data:', JSON.stringify(odooProducts[0]));
+            }
+            
+            for (const odooProduct of odooProducts) {
+                const product = this.transformOdooProduct(odooProduct);
+                
+                // Skip products without valid id
+                if (!product.id) {
+                    logger.warn(`Skipping product without id: ${product.name}`);
+                    this.syncStats.skipped++;
+                    continue;
+                }
+
+                // Skip products without template_id (required field in DB)
+                if (!product.template_id) {
+                    logger.warn(`Skipping product without template_id: [${product.id}] ${product.name}`);
+                    this.syncStats.skipped++;
+                    continue;
+                }
+
+                try {
+                    const existingProduct = localProductsMap.get(product.id);
+                    
+                    if (existingProduct) {
+                        // Product exists - check if it has changes
+                        if (this.hasChanges(product, existingProduct)) {
+                            await this.updateProduct(product, existingProduct.id);
+                        } else {
+                            this.syncStats.unchanged++;
+                            logger.debug(`No changes for: [${product.id}] ${product.name}`);
+                        }
+                    } else {
+                        // New product - create it
+                        await this.createProduct(product);
+                    }
+                } catch (error) {
+                    logger.error(`Error processing product ${product.id}:`, error.message);
+                    // Continue with next product
+                }
             }
 
             this.syncStats.lastSync = new Date().toISOString();
@@ -243,62 +328,19 @@ class ProductSyncService {
                 success: true,
                 stats: this.getStats(),
                 duration,
-                syncInfo: {
-                    lastSyncTime: syncData.last_sync_time,
-                    currentSyncTime: syncData.current_sync_time
+                summary: {
+                    totalFromOdoo: odooProducts.length,
+                    totalLocal: localProductsMap.size,
+                    created: this.syncStats.created,
+                    updated: this.syncStats.updated,
+                    unchanged: this.syncStats.unchanged,
+                    skipped: this.syncStats.skipped,
+                    errors: this.syncStats.errors
                 }
             };
 
         } catch (error) {
             logger.error('Product sync failed:', error.message);
-            return {
-                success: false,
-                error: error.message,
-                stats: this.getStats()
-            };
-        }
-    }
-
-    /**
-     * Full sync using prices endpoint (alternative method)
-     * Gets all products with their prices
-     */
-    async syncAllProducts() {
-        this.resetStats();
-        const startTime = Date.now();
-        
-        try {
-            logger.info('Starting full product sync from Odoo...');
-            
-            // Get all product prices from Odoo
-            const response = await odooApi.getProductPrices();
-            
-            if (response.status !== 'success') {
-                throw new Error(response.message || 'Failed to get products from Odoo');
-            }
-
-            const products = response.data || [];
-            logger.info(`Processing ${products.length} products...`);
-
-            // Process each product
-            for (const productData of products) {
-                const product = this.transformOdooProduct(productData);
-                await this.syncProduct(product);
-            }
-
-            this.syncStats.lastSync = new Date().toISOString();
-            
-            const duration = Date.now() - startTime;
-            logger.info(`Full product sync completed in ${duration}ms`, this.syncStats);
-            
-            return {
-                success: true,
-                stats: this.getStats(),
-                duration
-            };
-
-        } catch (error) {
-            logger.error('Full product sync failed:', error.message);
             return {
                 success: false,
                 error: error.message,
@@ -315,6 +357,24 @@ class ProductSyncService {
     }
 
     /**
+     * Get product by id
+     * @param {number} id 
+     */
+    async getProductById(id) {
+        const result = await db.query('SELECT * FROM products WHERE id = ?', [id]);
+        return result.length > 0 ? result[0] : null;
+    }
+
+    /**
+     * Get product by template_id
+     * @param {number} templateId 
+     */
+    async getProductByTemplateId(templateId) {
+        const result = await db.query('SELECT * FROM products WHERE template_id = ?', [templateId]);
+        return result.length > 0 ? result[0] : null;
+    }
+
+    /**
      * Get product by barcode
      * @param {string} barcode 
      */
@@ -325,15 +385,15 @@ class ProductSyncService {
 
     /**
      * Update product price only
-     * @param {string} barcode 
+     * @param {number} id 
      * @param {number} price 
      */
-    async updatePrice(barcode, price) {
+    async updatePrice(id, price) {
         await db.query(
-            'UPDATE products SET price = ?, updated_at = NOW() WHERE barcode = ?',
-            [price, barcode]
+            'UPDATE products SET price = ?, updated_at = NOW() WHERE id = ?',
+            [price, id]
         );
-        logger.info(`Updated price for ${barcode}: ${price}`);
+        logger.info(`Updated price for product ${id}: ${price}`);
     }
 }
 

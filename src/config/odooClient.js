@@ -28,8 +28,11 @@ async function getAuthToken() {
             }
         );
 
+        console.log("herhe check the token :)")
+        console.log(response.data)
+
         // Extract token from response
-        authToken = response.data.token || response.data.result?.token;
+        authToken = response.data.result?.token;
         
         if (!authToken) {
             throw new Error('No token in response');
@@ -70,6 +73,7 @@ async function odooRequest(endpoint, method = 'GET', data = null) {
         if (data && method !== 'GET') {
             config.data = data;
         }
+        console.log("i ma here :)))")
 
         logger.debug(`Odoo API Request: ${method} ${endpoint}`);
         const response = await axios(config);
@@ -140,8 +144,8 @@ const odooApi = {
      */
     async getAllProducts() {
         try {
-            const data = await odooRequest('/api/products/all', 'GET');
-            return data.data || data;
+            const data = await odooRequest('/api/products/all', 'POST', {});
+            return data.result;
         } catch (error) {
             logger.error('Failed to fetch all products:', error.message);
             throw error;
@@ -154,6 +158,8 @@ const odooApi = {
     async getProductsSync() {
         try {
             const data = await odooRequest('/api/sync/product', 'GET');
+            console.log("here &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&")
+            console.log(data)
             return data.data || data;
         } catch (error) {
             logger.error('Failed to fetch products sync:', error.message);
@@ -258,7 +264,7 @@ const odooApi = {
     async testConnection() {
         try {
             // Try to get products to test connection
-            await this.getLoyaltySync();
+            await this.getAllProducts();
             logger.info('✓ Odoo API connection successful');
             return true;
         } catch (error) {
