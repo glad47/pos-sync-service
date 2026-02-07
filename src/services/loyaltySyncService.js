@@ -1,11 +1,15 @@
 /**
  * Loyalty Sync Service (Unified)
  * Handles synchronization of loyalty programs between Odoo and local MySQL database.
- * Now uses a single loyalty_programs table with:
- *   type 0 = DISCOUNT
- *   type 1 = BUY_X_GET_Y
- *   trigger_product_ids = comma-separated barcodes
- *   reward_product_ids = comma-separated barcodes
+ * 
+ * The Odoo loyalty export (CSV) has one row per eligible product per program.
+ * We GROUP by program_id and collect all eligible_product_barcode values into
+ * a comma-separated list stored in trigger_product_ids and reward_product_ids.
+ * 
+ * The discount model is FIXED AMOUNT:
+ *   - Buy `min_qty` items from the eligible group
+ *   - Pay `after_discount` total instead of `total_price * min_qty`
+ *   - discount_amount = (total_price * min_qty) - after_discount
  */
 
 const db = require('../config/database');
@@ -31,6 +35,20 @@ class LoyaltySyncService {
         return { ...this.syncStats };
     }
 
+    /**
+     * Check if a loyalty program already exists by odoo_program_id
+     */
+    async loyaltyExistsByProgramId(odooProgramId) {
+        const result = await db.query(
+            'SELECT id, updated_at FROM loyalty_programs WHERE odoo_program_id = ?',
+            [odooProgramId]
+        );
+        return result.length > 0 ? result[0] : null;
+    }
+
+    /**
+     * Check if a loyalty program exists by trigger_product_ids and name (fallback)
+     */
     async loyaltyExists(triggerProductIds, name) {
         const result = await db.query(
             'SELECT id, updated_at FROM loyalty_programs WHERE trigger_product_ids = ? AND name = ?',
@@ -44,9 +62,12 @@ class LoyaltySyncService {
             const sql = `
                 INSERT INTO loyalty_programs (
                     name, type, trigger_product_ids, reward_product_ids,
-                    min_quantity, reward_quantity, discount_percent,
-                    active, start_date, end_date, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                    min_quantity, max_quantity, reward_quantity, 
+                    discount_percent, discount_amount, after_discount, total_price,
+                    active, start_date, end_date,
+                    odoo_program_id, odoo_rule_id, last_sync_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())
             `;
 
             const params = [
@@ -55,16 +76,22 @@ class LoyaltySyncService {
                 program.trigger_product_ids || null,
                 program.reward_product_ids || null,
                 program.min_quantity || 1,
+                program.max_quantity || 1,
                 program.reward_quantity || 1,
                 program.discount_percent || 0,
-                program.active !== false,
+                program.discount_amount || null,
+                program.after_discount || null,
+                program.total_price || null,
+                program.active !== false ? 1 : 0,
                 program.start_date || new Date(),
-                program.end_date || new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
+                program.end_date || new Date(Date.now() + 2 * 365 * 24 * 60 * 60 * 1000),
+                program.odoo_program_id || null,
+                program.odoo_rule_id || null
             ];
 
             const result = await db.query(sql, params);
             this.syncStats.loyalty.created++;
-            logger.info(`Created loyalty program: ${program.name}`);
+            logger.info(`Created loyalty program: ${program.name} (odoo_id=${program.odoo_program_id})`);
             return result.insertId;
         } catch (error) {
             this.syncStats.loyalty.errors++;
@@ -82,11 +109,18 @@ class LoyaltySyncService {
                     trigger_product_ids = ?,
                     reward_product_ids = ?,
                     min_quantity = ?,
+                    max_quantity = ?,
                     reward_quantity = ?,
                     discount_percent = ?,
+                    discount_amount = ?,
+                    after_discount = ?,
+                    total_price = ?,
                     active = ?,
                     start_date = ?,
                     end_date = ?,
+                    odoo_program_id = ?,
+                    odoo_rule_id = ?,
+                    last_sync_at = NOW(),
                     updated_at = NOW()
                 WHERE id = ?
             `;
@@ -97,17 +131,23 @@ class LoyaltySyncService {
                 program.trigger_product_ids || null,
                 program.reward_product_ids || null,
                 program.min_quantity || 1,
+                program.max_quantity || 1,
                 program.reward_quantity || 1,
                 program.discount_percent || 0,
-                program.active !== false,
+                program.discount_amount || null,
+                program.after_discount || null,
+                program.total_price || null,
+                program.active !== false ? 1 : 0,
                 program.start_date || new Date(),
-                program.end_date || new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+                program.end_date || new Date(Date.now() + 2 * 365 * 24 * 60 * 60 * 1000),
+                program.odoo_program_id || null,
+                program.odoo_rule_id || null,
                 existingId
             ];
 
             await db.query(sql, params);
             this.syncStats.loyalty.updated++;
-            logger.info(`Updated loyalty program: ${program.name}`);
+            logger.info(`Updated loyalty program: ${program.name} (id=${existingId})`);
         } catch (error) {
             this.syncStats.loyalty.errors++;
             logger.error(`Failed to update loyalty program ${program.name}:`, error.message);
@@ -116,79 +156,80 @@ class LoyaltySyncService {
     }
 
     /**
-     * Transform Odoo loyalty data to new unified format
+     * Group raw Odoo/CSV rows by program_id into loyalty programs.
+     * Each row has one eligible product; we collect all barcodes per program.
+     * 
+     * Expected row fields (from CSV/API):
+     *   program_id, program_name, 
+     *   loyalty_program_total_price, loyalty_program_after_discount, loyalty_program_discount,
+     *   loyalty_program_minimum_qty,
+     *   rule_id, rule_active,
+     *   eligible_product_barcode
      */
-    transformOdooLoyalty(odooData) {
-        const data = odooData.data || odooData;
+    groupByProgram(rows) {
+        const groups = new Map();
 
-        // Extract barcodes
-        let triggerBarcode = null;
-        let rewardBarcode = null;
+        for (const row of rows) {
+            const programId = row.program_id;
+            if (!programId) continue;
 
-        if (data.main_product?.barcode && data.main_product.barcode !== 'N/A') {
-            triggerBarcode = data.main_product.barcode;
-        } else if (data.main_product_barcode && data.main_product_barcode !== 'N/A') {
-            triggerBarcode = data.main_product_barcode;
-        }
+            const barcode = row.eligible_product_barcode || row.main_product_barcode;
+            if (!barcode) continue;
 
-        if (data.eligible_product?.barcode) {
-            rewardBarcode = data.eligible_product.barcode;
-        } else if (data.eligible_product_barcode) {
-            rewardBarcode = data.eligible_product_barcode;
-        } else if (data.reward_product?.barcode) {
-            rewardBarcode = data.reward_product.barcode;
-        }
-
-        // Determine program type
-        let programType = 0; // default DISCOUNT
-        let minQuantity = 1;
-        let rewardQuantity = 1;
-        let discountPercent = 0;
-
-        const rule = data.rule || {};
-
-        if (data.reward_product?.id && !rule.discount) {
-            // BUY_X_GET_Y
-            programType = 1;
-            minQuantity = parseInt(rule.minimum_qty || data.rule_min_qty) || 1;
-            rewardQuantity = 1;
-        } else if (rule.discount || parseFloat(rule.discount || 0) > 0) {
-            // DISCOUNT
-            programType = 0;
-            discountPercent = parseFloat(rule.discount || data.rule_discount || 0);
-        } else if (data.rule_after_discount || data.rule_total_price) {
-            programType = 0;
-            const originalPrice = parseFloat(data.rule_total_price || 0);
-            const afterDiscount = parseFloat(data.rule_after_discount || 0);
-            if (originalPrice > 0) {
-                discountPercent = ((originalPrice - afterDiscount) / originalPrice) * 100;
+            if (!groups.has(programId)) {
+                groups.set(programId, {
+                    program_id: programId,
+                    program_name: row.program_name,
+                    total_price: parseFloat(row.loyalty_program_total_price) || 0,
+                    after_discount: parseFloat(row.loyalty_program_after_discount) || 0,
+                    discount: parseFloat(row.loyalty_program_discount) || 0,
+                    min_qty: parseInt(row.loyalty_program_minimum_qty) || 1,
+                    rule_id: row.rule_id,
+                    rule_active: row.rule_active,
+                    barcodes: new Set()
+                });
             }
+
+            groups.get(programId).barcodes.add(barcode);
         }
 
-        const programName = this.extractName(data.program_name || data.name);
+        return groups;
+    }
+
+    /**
+     * Transform a grouped program into the loyalty_programs table format
+     */
+    transformGroupedProgram(group) {
+        const barcodes = [...group.barcodes].join(',');
+        const fullPrice = group.total_price * group.min_qty;
+        let discountPercent = 0;
+        if (fullPrice > 0) {
+            discountPercent = Math.round((group.discount / fullPrice) * 10000) / 100;
+        }
 
         return {
-            name: programName,
-            type: programType,
-            trigger_product_ids: triggerBarcode || null,
-            reward_product_ids: rewardBarcode || null,
-            min_quantity: minQuantity,
-            reward_quantity: rewardQuantity,
+            name: group.program_name || 'Unknown Program',
+            type: 0, // DISCOUNT (fixed amount)
+            trigger_product_ids: barcodes,
+            reward_product_ids: barcodes, // Same group: eligible = trigger = reward
+            min_quantity: group.min_qty,
+            max_quantity: 1,
+            reward_quantity: group.min_qty,
             discount_percent: discountPercent,
-            active: data.rule?.active !== false && data.rule_active !== false,
-            start_date: new Date(),
-            end_date: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
+            discount_amount: Math.round(group.discount * 100) / 100,
+            after_discount: Math.round(group.after_discount * 100) / 100,
+            total_price: Math.round(group.total_price * 100) / 100,
+            active: group.rule_active === 'True' || group.rule_active === true,
+            odoo_program_id: parseInt(group.program_id) || null,
+            odoo_rule_id: parseInt(group.rule_id) || null,
+            start_date: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000),
+            end_date: new Date(Date.now() + 2 * 365 * 24 * 60 * 60 * 1000)
         };
     }
 
-    extractName(name) {
-        if (typeof name === 'string') return name;
-        if (typeof name === 'object' && name !== null) {
-            return name.ar_001 || name.en_US || name.en || Object.values(name)[0] || 'Unknown Program';
-        }
-        return 'Unknown Program';
-    }
-
+    /**
+     * Sync a single loyalty program (upsert by odoo_program_id, then by name)
+     */
     async syncLoyaltyProgram(program) {
         if (!program.name) {
             logger.warn('Skipping loyalty program without name');
@@ -197,7 +238,15 @@ class LoyaltySyncService {
         }
 
         try {
-            const existing = await this.loyaltyExists(program.trigger_product_ids, program.name);
+            // Try by odoo_program_id first
+            let existing = null;
+            if (program.odoo_program_id) {
+                existing = await this.loyaltyExistsByProgramId(program.odoo_program_id);
+            }
+            // Fallback: by trigger_product_ids + name
+            if (!existing) {
+                existing = await this.loyaltyExists(program.trigger_product_ids, program.name);
+            }
 
             if (existing) {
                 await this.updateLoyaltyProgram(program, existing.id);
@@ -212,6 +261,9 @@ class LoyaltySyncService {
         }
     }
 
+    /**
+     * Sync from Odoo (incremental)
+     */
     async syncFromOdoo() {
         this.resetStats();
         const startTime = Date.now();
@@ -231,10 +283,14 @@ class LoyaltySyncService {
                 ...(changes.updated || [])
             ];
 
-            logger.info(`Processing ${allChanges.length} loyalty changes...`);
+            logger.info(`Processing ${allChanges.length} loyalty change rows...`);
 
-            for (const change of allChanges) {
-                const transformed = this.transformOdooLoyalty(change);
+            // Group by program_id
+            const groups = this.groupByProgram(allChanges);
+            logger.info(`Grouped into ${groups.size} loyalty programs`);
+
+            for (const [programId, group] of groups) {
+                const transformed = this.transformGroupedProgram(group);
                 await this.syncLoyaltyProgram(transformed);
             }
 
@@ -263,6 +319,9 @@ class LoyaltySyncService {
         }
     }
 
+    /**
+     * Full sync - Load all loyalty programs from Odoo
+     */
     async syncAllLoyaltyPrograms() {
         this.resetStats();
         const startTime = Date.now();
@@ -276,19 +335,15 @@ class LoyaltySyncService {
                 throw new Error(response.message || 'Failed to get loyalty programs from Odoo');
             }
 
-            const programs = response.data || [];
-            logger.info(`Processing ${programs.length} loyalty programs...`);
+            const rows = response.data || [];
+            logger.info(`Processing ${rows.length} loyalty rows from Odoo...`);
 
-            const programsMap = new Map();
-            for (const programData of programs) {
-                const programId = programData.program_id;
-                if (!programsMap.has(programId)) {
-                    programsMap.set(programId, programData);
-                }
-            }
+            // Group all rows by program_id
+            const groups = this.groupByProgram(rows);
+            logger.info(`Grouped into ${groups.size} loyalty programs`);
 
-            for (const [programId, programData] of programsMap) {
-                const transformed = this.transformOdooLoyalty(programData);
+            for (const [programId, group] of groups) {
+                const transformed = this.transformGroupedProgram(group);
                 await this.syncLoyaltyProgram(transformed);
             }
 
