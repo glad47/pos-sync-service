@@ -2,6 +2,9 @@
  * Product Sync Service
  * Handles synchronization of products between Odoo and local MySQL database
  * Compares using id and only updates changed records
+ * Now handles both active and inactive products correctly
+ * 
+ * FIXED: Archive/unarchive detection now works correctly
  */
 
 const db = require('../config/database');
@@ -66,27 +69,53 @@ class ProductSyncService {
      * @returns {boolean} True if product has changes
      */
     hasChanges(odooProduct, localProduct) {
+        // Helper to normalize active field (handles both boolean and numeric)
+        const normalizeActive = (v) => {
+            if (typeof v === 'boolean') return v ? 1 : 0;
+            if (typeof v === 'number') return v ? 1 : 0;
+            if (v === 'true' || v === '1') return 1;
+            if (v === 'false' || v === '0') return 0;
+            return v !== false && v !== 0 ? 1 : 0;
+        };
+
+        // Helper to normalize numeric values
+        const normalizeNumber = (v, defaultVal = 0) => {
+            const num = parseFloat(v);
+            return isNaN(num) ? defaultVal : num;
+        };
+
+        const normalizeInt = (v, defaultVal = 0) => {
+            const num = parseInt(v);
+            return isNaN(num) ? defaultVal : num;
+        };
+
         // Compare relevant fields
         const fieldsToCompare = [
-            { odoo: 'template_id', local: 'template_id', transform: (v) => parseInt(v) || null },
+            { odoo: 'template_id', local: 'template_id' },
             { odoo: 'name', local: 'name' },
             { odoo: 'description', local: 'description' },
             { odoo: 'barcode', local: 'barcode' },
-            { odoo: 'list_price', local: 'price', transform: (v) => parseFloat(v) || 0 },
-            { odoo: 'stock', local: 'stock', transform: (v) => parseInt(v) || 0 },
+            { odoo: 'list_price', local: 'price' },
+            { odoo: 'stock', local: 'stock' },
             { odoo: 'category', local: 'category' },
-            { odoo: 'tax_rate', local: 'tax_rate', transform: (v) => parseFloat(v) || 0 },
-            { odoo: 'active', local: 'active', transform: (v) => v !== false ? 1 : 0 }
+            { odoo: 'tax_rate', local: 'tax_rate' },
+            { odoo: 'active', local: 'active' }
         ];
 
         for (const field of fieldsToCompare) {
             let odooValue = odooProduct[field.odoo];
             let localValue = localProduct[field.local];
 
-            // Apply transformation if specified
-            if (field.transform) {
-                odooValue = field.transform(odooValue);
-                localValue = field.transform(localValue);
+            // Normalize values based on field type
+            if (field.odoo === 'active') {
+                odooValue = normalizeActive(odooValue);
+                localValue = normalizeActive(localValue);
+            } else if (field.odoo === 'template_id' || field.odoo === 'stock') {
+                odooValue = normalizeInt(odooValue, null);
+                localValue = normalizeInt(localValue, null);
+            } else if (field.odoo === 'list_price' || field.odoo === 'tax_rate') {
+                odooValue = normalizeNumber(odooValue, 0);
+                localValue = normalizeNumber(localValue, 0);
             }
 
             // Handle null/undefined comparison
@@ -132,7 +161,7 @@ class ProductSyncService {
 
             await db.query(sql, params);
             this.syncStats.created++;
-            logger.info(`Created product: [${product.id}] ${product.name}`);
+            logger.info(`Created product: [${product.id}] ${product.name} (active=${product.active})`);
             return product.id;
         } catch (error) {
             this.syncStats.errors++;
@@ -178,7 +207,7 @@ class ProductSyncService {
 
             await db.query(sql, params);
             this.syncStats.updated++;
-            logger.info(`Updated product: [${product.id}] ${product.name}`);
+            logger.info(`Updated product: [${product.id}] ${product.name} (active=${product.active})`);
         } catch (error) {
             this.syncStats.errors++;
             logger.error(`Failed to update product ${product.id}:`, error.message);
@@ -210,6 +239,18 @@ class ProductSyncService {
             templateId = data.template_id;
         }
         
+        // Active status: product is active only if the 'active' field is true
+        // The API now returns both active and inactive products
+        // If template_active and product_active are provided, both must be true
+        let isActive;
+        if (data.template_active !== undefined && data.product_active !== undefined) {
+            isActive = data.template_active && data.product_active;
+        } else if (data.active !== undefined) {
+            isActive = data.active;
+        } else {
+            isActive = true; // Default to active if no status provided
+        }
+        
         return {
             id: productId ?? null,
             template_id: templateId ?? null,
@@ -220,7 +261,7 @@ class ProductSyncService {
             stock: parseInt(data.stock || data.qty_available) || 0,
             category: this.extractCategory(data.category),
             tax_rate: parseFloat(data.tax_rate) || 0.15,
-            active: data.active !== false
+            active: isActive
         };
     }
 
@@ -350,7 +391,14 @@ class ProductSyncService {
     }
 
     /**
-     * Get all local products
+     * Get all local products (active and inactive)
+     */
+    async getAllLocalProducts() {
+        return await db.query('SELECT * FROM products ORDER BY name');
+    }
+
+    /**
+     * Get active local products only
      */
     async getLocalProducts() {
         return await db.query('SELECT * FROM products WHERE active = TRUE ORDER BY name');
@@ -394,6 +442,19 @@ class ProductSyncService {
             [price, id]
         );
         logger.info(`Updated price for product ${id}: ${price}`);
+    }
+
+    /**
+     * Activate/Deactivate product
+     * @param {number} id 
+     * @param {boolean} active 
+     */
+    async updateActiveStatus(id, active) {
+        await db.query(
+            'UPDATE products SET active = ?, updated_at = NOW() WHERE id = ?',
+            [active ? 1 : 0, id]
+        );
+        logger.info(`Updated active status for product ${id}: ${active}`);
     }
 }
 

@@ -185,8 +185,8 @@ const odooApi = {
      */
     async getAllLoyaltyPrograms() {
         try {
-            const data = await odooRequest('/api/loyalty/programs', 'GET');
-            return data.data || data;
+            const data = await odooRequest('/api/loyalty/all', 'GET');
+            return data;
         } catch (error) {
             logger.error('Failed to fetch loyalty programs:', error.message);
             throw error;
@@ -198,8 +198,8 @@ const odooApi = {
      */
     async getLoyaltySync() {
         try {
-            const data = await odooRequest('/api/sync/loyalty', 'GET');
-            return data.data || data;
+            const data = await odooRequest('/api/loyalty/all', 'GET');
+            return data;
         } catch (error) {
             logger.error('Failed to fetch loyalty sync:', error.message);
             throw error;

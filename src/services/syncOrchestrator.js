@@ -124,11 +124,11 @@ class SyncOrchestrator {
             }
 
             // Sync loyalty programs (uncomment when ready)
-            // logger.info('--- Syncing Loyalty Programs ---');
-            // results.loyalty = await loyaltySyncService.syncFromOdoo();
-            // if (!results.loyalty.success) {
-            //     logger.warn('Loyalty sync had issues:', results.loyalty.error);
-            // }
+            logger.info('--- Syncing Loyalty Programs ---');
+            results.loyalty = await loyaltySyncService.syncAllLoyaltyPrograms();
+            if (!results.loyalty.success) {
+                logger.warn('Loyalty sync had issues:', results.loyalty.error);
+            }
 
             results.endTime = new Date().toISOString();
             results.duration = Date.now() - startTime;
@@ -139,6 +139,7 @@ class SyncOrchestrator {
             logger.info('========================================');
             logger.info(`Full Sync Completed in ${results.duration}ms`);
             logger.info(`Products: ${JSON.stringify(results.products?.stats || {})}`);
+            logger.info(`Loyality: ${JSON.stringify(results.loyalty?.stats || {})}`);
             logger.info('========================================');
 
             return results;
