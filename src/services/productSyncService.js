@@ -303,11 +303,11 @@ class ProductSyncService {
             logger.info('Loading products from Odoo...');
             const response = await odooApi.getAllProducts();
             
-            if (response.status !== 'success') {
-                throw new Error(response.message || 'Failed to get products from Odoo');
-            }
+            // if (response.status !== 'success') {
+            //     throw new Error(response.message || 'Failed to get products from Odoo');
+            // }
 
-            const odooProducts = response.data || [];
+            const odooProducts = response;
             logger.info(`Loaded ${odooProducts.length} products from Odoo`);
 
             // Step 2: Load all local products indexed by id

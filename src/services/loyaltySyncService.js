@@ -9,6 +9,10 @@
  * We GROUP by program_id and collect all eligible_product_id values into
  * a comma-separated list stored in trigger_product_ids and reward_product_ids.
  * 
+ * FIX: For BUY X GET Y programs, trigger_product_ids and reward_product_ids
+ * are now stored SEPARATELY based on Odoo's main_product/eligible_products (trigger)
+ * vs reward_product (free item).
+ * 
  * FIXED: Archive/unarchive detection and false update reporting
  */
 
@@ -175,6 +179,12 @@ class LoyaltySyncService {
     /**
      * Group raw Odoo rows by program_id into loyalty programs.
      * 
+     * For BUY X GET Y programs, trigger and reward products are stored SEPARATELY:
+     *   - trigger_product_ids = eligible_products (the items customer must buy)
+     *   - reward_product_ids  = reward_product (the free item)
+     * 
+     * For PROMOTION programs, both are set to the same eligible_products list.
+     * 
      * Expected row format from Odoo API:
      * {
      *   program_id: number,
@@ -208,6 +218,9 @@ class LoyaltySyncService {
             const programId = row.program_id;
             if (!programId) continue;
 
+            const programType = (row.promotion_type || row.type || 'promotion').toLowerCase();
+            const isBuyXGetY = (programType === 'buy_x_get_y' || programType === 'buyxgety');
+
             // For each row, collect product IDs from eligible_products array
             const eligibleProducts = row.eligible_products || [];
             
@@ -215,7 +228,7 @@ class LoyaltySyncService {
                 groups.set(programId, {
                     program_id: programId,
                     program_name: row.name,
-                    program_type: row.promotion_type || row.type || 'promotion',
+                    program_type: programType,
                     total_price: parseFloat(row.loyalty_program_total_price || row.total_price) || 0,
                     after_discount: parseFloat(row.loyalty_program_after_discount || row.after_discount) || 0,
                     discount: parseFloat(row.loyalty_program_discount || row.discount_amount) || 0,
@@ -227,20 +240,48 @@ class LoyaltySyncService {
                     rule_id: row.rule_id,
                     rule_active: row.rule_active,
                     active: row.active,
-                    product_ids: new Set()
+                    // Separate sets for trigger vs reward products
+                    trigger_product_ids: new Set(),
+                    reward_product_ids: new Set(),
+                    // Keep legacy combined set for promotion type
+                    product_ids: new Set(),
+                    is_buy_x_get_y: isBuyXGetY
                 });
             }
 
-            // Add all eligible product IDs
-            for (const product of eligibleProducts) {
-                if (product && product.id) {
-                    groups.get(programId).product_ids.add(product.id);
-                }
-            }
+            const group = groups.get(programId);
 
-            // Also add main_product if it exists and eligible_products is empty
-            if (eligibleProducts.length === 0 && row.main_product && row.main_product.id) {
-                groups.get(programId).product_ids.add(row.main_product.id);
+            if (isBuyXGetY) {
+                // ===== BUY X GET Y: separate trigger and reward =====
+                
+                // Trigger products = eligible_products (items customer must buy)
+                for (const product of eligibleProducts) {
+                    if (product && product.id) {
+                        group.trigger_product_ids.add(product.id);
+                    }
+                }
+                
+                // Also add main_product as trigger if eligible_products is empty
+                if (eligibleProducts.length === 0 && row.main_product && row.main_product.id) {
+                    group.trigger_product_ids.add(row.main_product.id);
+                }
+
+                // Reward product = the FREE item (reward_product field from Odoo)
+                if (row.reward_product && row.reward_product.id) {
+                    group.reward_product_ids.add(row.reward_product.id);
+                }
+            } else {
+                // ===== PROMOTION: trigger and reward are the same =====
+                for (const product of eligibleProducts) {
+                    if (product && product.id) {
+                        group.product_ids.add(product.id);
+                    }
+                }
+
+                // Also add main_product if eligible_products is empty
+                if (eligibleProducts.length === 0 && row.main_product && row.main_product.id) {
+                    group.product_ids.add(row.main_product.id);
+                }
             }
         }
 
@@ -275,23 +316,43 @@ class LoyaltySyncService {
      * Transform a grouped program into the loyalty_programs table format
      */
     transformGroupedProgram(group) {
-        // Sort product IDs for consistent storage
-        const productIds = [...group.product_ids].sort((a, b) => a - b).join(',');
+        // Determine type: 0 = DISCOUNT/PROMOTION, 1 = BUY X GET Y
+        const programType = (group.program_type || '').toLowerCase();
+        const type = (programType === 'buy_x_get_y' || programType === 'buyxgety') ? 1 : 0;
+
+        let triggerProductIds;
+        let rewardProductIds;
+
+        if (type === 1) {
+            // ===== BUY X GET Y: trigger and reward are DIFFERENT =====
+            triggerProductIds = [...group.trigger_product_ids].sort((a, b) => a - b).join(',');
+            rewardProductIds = [...group.reward_product_ids].sort((a, b) => a - b).join(',');
+            
+            // If reward is empty but trigger has products, log a warning
+            if (!rewardProductIds && triggerProductIds) {
+                logger.warn(`BUY X GET Y program [${group.program_id}] ${group.program_name} has no reward products, using trigger as fallback`);
+                rewardProductIds = triggerProductIds;
+            }
+            
+            logger.info(`BUY X GET Y [${group.program_id}] ${group.program_name}: trigger=[${triggerProductIds}] reward=[${rewardProductIds}]`);
+        } else {
+            // ===== PROMOTION: trigger and reward are the SAME =====
+            const productIds = [...group.product_ids].sort((a, b) => a - b).join(',');
+            triggerProductIds = productIds;
+            rewardProductIds = productIds;
+        }
+
         const fullPrice = group.total_price * group.min_qty;
         let discountPercent = 0;
         if (fullPrice > 0) {
             discountPercent = Math.round((group.discount / fullPrice) * 10000) / 100;
         }
 
-        // Determine type: 0 = DISCOUNT/PROMOTION, 1 = BUY X GET Y
-        const programType = (group.program_type || '').toLowerCase();
-        const type = (programType === 'buy_x_get_y' || programType === 'buyxgety') ? 1 : 0;
-
         return {
             name: group.program_name || 'Unknown Program',
             type: type,
-            trigger_product_ids: productIds,
-            reward_product_ids: productIds,
+            trigger_product_ids: triggerProductIds,
+            reward_product_ids: rewardProductIds,
             min_quantity: group.min_qty || group.buy_quantity || 1,
             max_quantity: 1,
             reward_quantity: group.reward_quantity || group.free_quantity || 1,
@@ -344,7 +405,7 @@ class LoyaltySyncService {
 
             const result = await db.query(sql, params);
             this.syncStats.created++;
-            logger.info(`Created loyalty program: [${program.odoo_program_id}] ${program.name} (active=${program.active})`);
+            logger.info(`Created loyalty program: [${program.odoo_program_id}] ${program.name} (type=${program.type}, active=${program.active})`);
             return result.insertId;
         } catch (error) {
             this.syncStats.errors++;
@@ -403,7 +464,7 @@ class LoyaltySyncService {
 
             await db.query(sql, params);
             this.syncStats.updated++;
-            logger.info(`Updated loyalty program: [${program.odoo_program_id}] ${program.name} (id=${existingId}, active=${program.active})`);
+            logger.info(`Updated loyalty program: [${program.odoo_program_id}] ${program.name} (id=${existingId}, type=${program.type}, active=${program.active})`);
         } catch (error) {
             this.syncStats.errors++;
             logger.error(`Failed to update loyalty program ${program.name}:`, error.message);

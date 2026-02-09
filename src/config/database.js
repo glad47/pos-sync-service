@@ -15,7 +15,7 @@ const initializePool = () => {
     if (pool) return pool;
 
     pool = mysql.createPool({
-        host: process.env.MYSQL_HOST || 'localhost',
+        host: process.env.MYSQL_HOST || 'mysql',
         port: parseInt(process.env.MYSQL_PORT) || 3306,
         database: process.env.MYSQL_DATABASE || 'pos_db',
         user: process.env.MYSQL_USER || 'root',

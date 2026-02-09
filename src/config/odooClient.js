@@ -67,13 +67,14 @@ async function odooRequest(endpoint, method = 'GET', data = null) {
                 'Authorization': authToken,
                 'Content-Type': 'application/json'
             },
-            timeout: 30000
+            timeout: 60000, // Increase to 60 seconds
+            maxContentLength: 50 * 1024 * 1024, // Allow up to 50MB
+            maxBodyLength: 50 * 1024 * 1024
         };
 
         if (data && method !== 'GET') {
             config.data = data;
         }
-        console.log("i ma here :)))")
 
         logger.debug(`Odoo API Request: ${method} ${endpoint}`);
         const response = await axios(config);
@@ -142,15 +143,38 @@ const odooApi = {
     /**
      * Get all products from Odoo
      */
-    async getAllProducts() {
-        try {
-            const data = await odooRequest('/api/products/all', 'POST', {});
-            return data.result;
-        } catch (error) {
-            logger.error('Failed to fetch all products:', error.message);
-            throw error;
+    
+    async  getAllProducts() {
+        const allProducts = [];
+        let offset = 0;
+        const limit = 1000;
+        let hasMore = true;
+
+        while (hasMore) {
+            try {
+                const response = await odooRequest(
+                    `/api/products/all?limit=${limit}&offset=${offset}`,
+                    'GET'
+                );
+
+                if (response.status === 'success') {
+                    allProducts.push(...response.data);
+                    hasMore = response.has_more;
+                    offset += limit;
+                    
+                    logger.info(`Fetched ${allProducts.length}/${response.total} products`);
+                } else {
+                    throw new Error('API returned error status');
+                }
+            } catch (error) {
+                logger.error(`Failed to fetch products at offset ${offset}:`, error.message);
+                throw error;
+            }
         }
+
+        return allProducts;
     },
+   
 
     /**
      * Get products sync data (incremental)

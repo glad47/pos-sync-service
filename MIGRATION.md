@@ -29,13 +29,13 @@ The new version simplifies Odoo authentication by using username/password instea
 
 **Before (.env):**
 ```env
-ODOO_BASE_URL=http://localhost:8069
+ODOO_BASE_URL=https://odoo.q-mart.net
 ODOO_API_TOKEN=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 ```
 
 **After (.env):**
 ```env
-ODOO_BASE_URL=http://localhost:8069
+ODOO_BASE_URL=https://odoo.q-mart.net
 ODOO_USERNAME=admin
 ODOO_PASSWORD=your-password
 ```
